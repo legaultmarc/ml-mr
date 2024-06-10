@@ -6,7 +6,7 @@ distribution.
 import argparse
 import json
 import os
-from typing import Iterable, List, Optional, Tuple, Any, Union, Type
+from typing import Callable, Iterable, List, Optional, Tuple, Any, Union, Type
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -14,15 +14,17 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset, random_split
 import pytorch_lightning as pl
+from sklearn.decomposition import PCA
+from scipy import stats
 
 from ..logging import info
 from ..utils import default_validate_args, parse_project_and_run_name
 from ..utils.models import MLP, OutcomeMLPBase
 from ..utils.quantiles import QuantileLossMulti
 from ..utils.training import train_model, resample_dataset
-from ..utils.data import IVDataset, IVDatasetWithGenotypes
+from ..utils.data import IVDataset, IVDatasetWithGenotypes, FullBatchDataLoader
 from ..utils import _cat
-from .core import MREstimator
+from .core import MREstimator, MREstimatorWithUncertainty
 
 # Default values definitions.
 # fmt: off
@@ -288,6 +290,175 @@ class QuantileIVEstimator(MREstimator):
         outcome_network.eval()  # type: ignore
 
         return cls(exposure_network, outcome_network, meta=meta, covars=covars)
+
+
+class QuantileIVLinearEstimator(MREstimatorWithUncertainty):
+    """
+    QuantileIV estimator that uses the linear inference strategy, which
+    consists of performing IV linear regression manually in the new
+    representation of the exposure learned by the outcome neural network.
+    """
+    def __init__(
+        self,
+        dataset: IVDataset,
+        parent: QuantileIVEstimator
+    ):
+        self.parent = parent
+        self.exposure_network = parent.exposure_network
+        self.outcome_network = parent.outcome_network
+        self.covars = parent.covars
+        self.pca = self.init_PCA()
+        self.dataset = dataset
+        self.h = self.linear_inference(dataset)
+
+    def iv_reg_function(
+        self,
+        x: torch.Tensor,
+        covars: Optional[torch.Tensor] = None,
+        alpha: float = 0.1
+    ):
+        ys, se_ys = self.h(x, covars)
+        lower_ci = ys + stats.norm.ppf(alpha/2) * se_ys
+        upper_ci = ys + stats.norm.ppf(1-alpha/2) * se_ys
+
+        return torch.hstack([lower_ci, ys, upper_ci]).view(
+            len(ys), 1, 3
+        )
+
+    def avg_iv_reg_function(
+            self,
+            x: torch.Tensor,
+            covars: Optional[torch.Tensor] = None,
+            low_memory: bool = False,
+            alpha: float = 0.1
+    ) -> torch.Tensor:
+        return super().avg_iv_reg_function(x, covars)
+
+    def init_PCA(self, n_components: float = 0.999, random_state: int = 42):
+        pca = PCA(n_components=n_components, random_state=random_state)
+        return pca
+
+    def read_ivdataset(self, dataset: IVDataset) -> Tuple:
+        dl = FullBatchDataLoader(dataset)
+        x, y, ivs, covars = next(iter(dl))
+        return x, y, ivs, covars
+
+    def linear_inference(
+        self,
+        dataset: IVDataset
+    ) -> Callable[[torch.Tensor, Optional[torch.Tensor]], torch.Tensor]:
+        x, y, ivs, covars = self.read_ivdataset(dataset)
+
+        covars = covars.unsqueeze(-1)
+        
+        x_hats = self.exposure_network(_cat(ivs, covars))
+        n_quantiles = x_hats.size(1)
+        n = x.size(0)
+
+        eta_bar = None
+        # Loop through all quantiles
+        # Equivalent to the 1/K sum step in equation (6)
+        for j in range(n_quantiles):
+            current_representation = self.outcome_network.get_repr(
+                _cat(x_hats[:, [j]], covars)
+            ) / (n_quantiles)
+
+            if eta_bar is None:
+                eta_bar = current_representation
+            else:
+                eta_bar += current_representation
+
+        assert eta_bar is not None
+
+        # Fit PCA
+        self.pca.fit(eta_bar.detach().numpy())
+        eta_bar_pca = torch.from_numpy(
+            self.pca.transform(eta_bar.detach().numpy())
+        )
+        # Add intercept column
+        eta_bar_pca = torch.hstack((torch.ones((n, 1)), eta_bar_pca))
+
+        # Get the representation of the exposure x 
+        H = self.outcome_network.get_repr(
+            _cat(x, covars)
+        )
+        # Apply PCA to the representation of the exposure x
+        H_pca = torch.from_numpy(
+            self.pca.transform(H.detach().numpy())
+        )
+
+        # Add intercept column
+        H_pca = torch.hstack((torch.ones((n, 1)), H_pca))
+
+        # We now compute the IV regression
+        beta_IV_hat = torch.linalg.inv(
+            eta_bar_pca.T @ H_pca) @ eta_bar_pca.T @ y
+
+        # We compute the variance of the coefficients beta_IV_hat
+        mat_etabar_H_inv = torch.linalg.inv(eta_bar_pca.T @ H_pca)
+        mat_etabar = eta_bar_pca
+        mat_diag = torch.diag(((H_pca @ beta_IV_hat - y) ** 2).reshape(-1))
+        var_beta_IV_hat = (
+            mat_etabar_H_inv
+            @ mat_etabar.T
+            @ mat_diag
+            @ mat_etabar
+            @ mat_etabar_H_inv
+        )
+
+        # Estimated h_hat function
+        def iv_reg(x, covars):
+            eta = self.outcome_network.get_repr(
+                _cat(x, covars)
+            )
+            eta_pca = torch.from_numpy(
+                self.pca.transform(eta.detach().numpy())
+            )
+            """
+            # If we have covariables, we marginalize over the covariates
+            if covars is not None:
+                eta_pca = torch.vstack([
+                    tens.mean(dim=0, keepdim=True)
+                    for tens in torch.split(eta_pca, covars.shape[0])
+                ])
+            """
+            # Add intercept column
+            eta_pca = torch.hstack((torch.ones((eta_pca.size(0), 1)), eta_pca))
+
+            # IV regression using the estimated beta_IV_hat
+            h_hat = beta_IV_hat.T @ eta_pca.T
+            se_h_hat = torch.sqrt(
+                torch.clip(
+                    torch.diag(eta_pca @ var_beta_IV_hat @ eta_pca.T), 1e-200
+                )
+            )
+            h_hat = h_hat.squeeze().reshape(-1, 1)
+            se_h_hat = se_h_hat.squeeze().reshape(-1, 1)
+
+            return h_hat, se_h_hat
+
+        return iv_reg
+
+    def ate(
+        self,
+        x0: torch.Tensor,
+        x1: torch.Tensor
+    ) -> torch.Tensor:
+        y1 = self.avg_iv_reg_function(x1)
+        y0 = self.avg_iv_reg_function(x0)
+
+        return y1 - y0
+
+    def cate(
+        self,
+        x0: torch.Tensor,
+        x1: torch.Tensor,
+        covars: torch.Tensor
+    ) -> torch.Tensor:
+        y1 = self.avg_iv_reg_function(x1, covars)
+        y0 = self.avg_iv_reg_function(x0, covars)
+
+        return y1 - y0
 
 
 def main(args: argparse.Namespace) -> None:
